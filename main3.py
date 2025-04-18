@@ -3,6 +3,8 @@ import argparse
 import copy
 import os
 import sys
+from pathlib import Path
+
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -81,6 +83,9 @@ def execute_experiment(config, iteration=0):
         train_data, batch_size=config.batch_size, shuffle=True, num_workers=0, drop_last=False)
     test_iterator = torch.utils.data.DataLoader(
         test_data, batch_size=config.batch_size, shuffle=False, num_workers=0, drop_last=True)
+    bn_calibration_iterator = torch.utils.data.DataLoader(
+        train_data, batch_size=config.batch_size, shuffle=False, num_workers=0, drop_last=True)
+
 
     # Model Selection
     global network
@@ -145,10 +150,12 @@ def execute_experiment(config, iteration=0):
                         counter += 1
                 counter = 0
             else:
-                checkpoint_path = f"{exp_dir}/checkpoints/model_4_init.pth"
-                original_weights = torch.load(checkpoint_path, map_location='cpu')
+                checkpoint_path = Path(f"{exp_dir}/model_4_init.pth")
+                if checkpoint_path.exists():
+                    original_weights = torch.load(checkpoint_path, map_location=hardware)
                 restore_initial_weights(weight_masks, original_weights)
-            optim = torch.optim.Adam(network.parameters(), lr=config.lr, weight_decay=1e-4)
+                recalibrate_bn(network, bn_calibration_iterator, num_batches=30)
+            optim = torch.optim.SGD(network.parameters(), lr=config.lr, momentum=0.9, weight_decay=1e-4)
 
         print(f"\n--- Pruning Cycle [{iteration}:{prune_iter}/{prune_cycles}]: ---")
 
@@ -165,9 +172,10 @@ def execute_experiment(config, iteration=0):
                     top_accuracy = current_accuracy
                     torch.save(network, f"{exp_dir}/{prune_iter}_model_{config.prune_type}.pth.tar")
             if epoch == 49 or epoch == 63:
-                lr = config.lr / 10
-            if epoch == 4:
-                torch.save(network.state_dict(), f"{exp_dir}/checkpoints/model_4_init.pth")
+                for g in optim.param_groups:
+                    g['lr'] = g['lr'] * 0.1
+            if epoch == 0:
+                torch.save(network.state_dict(), f"{exp_dir}/model_4_init.pth")
             # Train Model
             current_loss = fit_network(network, train_iterator, optim, loss_function)
             losses[epoch] = current_loss
@@ -298,7 +306,14 @@ def evaluate_network(network, eval_iterator, loss_fn):
     return accuracy
 
 
-# ResNet VGG
+def recalibrate_bn(model, data_loader, num_batches=40):
+    model.train()
+    with torch.no_grad():
+        for i, (x, _) in enumerate(data_loader):
+            if i >= num_batches:
+                break
+            _ = model(x.cuda())
+
 def global_trim_weights_by_threshold(threshold, resample=False, reset=False, **extras):
     global counter
     global weight_masks
@@ -381,7 +396,7 @@ def restore_initial_weights(mask_array, original_weights):
             weight.data = torch.from_numpy(mask_array[counter] * original_weights[param_name].cpu().numpy()).to(
                 weight_device)
             counter += 1
-        elif 'bias' in param_name:
+        else:
             weight.data = original_weights[param_name]
     counter = 0
 
@@ -442,7 +457,7 @@ if __name__ == "__main__":
     parser.add_argument("--arch_type", default="resnet18", type=str,
                         help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
     parser.add_argument("--prune_percent", default=35.6, type=int, help="Pruning percent")
-    parser.add_argument("--prune_iterations", default=7, type=int, help="Pruning iterations count")
+    parser.add_argument("--prune_iterations", default=10, type=int, help="Pruning iterations count")
 
 
     args = parser.parse_args()
